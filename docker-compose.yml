@@ -45,17 +45,17 @@ services:
       # Model configuration (download with ./download-model.sh or ./download-model-q4.sh)
       # Q8 model (default): Qwen3-Coder-30B-A3B-Instruct-1M-UD-Q8_K_XL.gguf
       # Q4 model (smaller): Qwen3-Coder-30B-A3B-Instruct-1M-UD-Q4_K_XL.gguf
-      - MODEL_PATH=/models/Qwen3-Coder-30B-A3B-Instruct-1M-UD-Q4_K_XL.gguf
+      - MODEL_PATH=/models/Qwen3-Coder-30B-A3B-Instruct-1M-UD-Q8_K_XL.gguf
       - MODEL_ALIAS=qwen3-coder
 
       # GPU layers - Vulkan backend (999 = all layers on GPU)
       - GPU_LAYERS=999
 
-      # Context window - reduced for Radeon 780M
-      - CTX_SIZE=524288
+      # Context window - 1M tokens (full capacity for Radeon 8060S)
+      - CTX_SIZE=1048576
 
-      # Single slot for maximum context per request
-      - PARALLEL=1
+      # Parallel request slots (2 = concurrent requests supported)
+      - PARALLEL=2
 
       # Performance optimizations
       - FLASH_ATTENTION=true
@@ -63,7 +63,7 @@ services:
 
       # KV cache quantization: q8_0 for quality, q4_0 for max context
       # Options: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
-      - KV_CACHE_TYPE=q4_0
+      - KV_CACHE_TYPE=q8_0
 
       # Batch sizes
       - BATCH_SIZE=2048
@@ -86,13 +86,20 @@ services:
       - "44"    # video
       - "992"   # render (adjust if different on your system)
 
-    # Memory limits (adjusted for 64GB system)
+    # Allow unlimited memory locking (required for MLOCK=true)
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+    # Memory limits for 128GB Ryzen AI Max+ 395 system
+    # Q8 model (~34GB) + q8_0 KV cache (~52GB) = ~85GB required
     deploy:
       resources:
         limits:
-          memory: 50G
+          memory: 110G
         reservations:
-          memory: 30G
+          memory: 85G
 
 volumes:
   llama-cache:
