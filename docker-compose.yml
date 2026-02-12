@@ -2,104 +2,172 @@
 # StrixHalo LLM Server - Optimized for AMD Ryzen AI Max+ 395
 #
 # Features:
-# - 1M token context window (full model capacity)
+# - Qwen3 models with tool/function calling support
 # - q8_0 KV cache quantization (quality + memory balance)
-# - Vulkan GPU acceleration via Mesa RADV (Radeon 8060S)
+# - ROCm HIP GPU acceleration (Radeon 8060S / gfx1151)
 # - OpenAI-compatible API on port 8091
 #
-# Download model first:
-#   ./download-model.sh      # Q8 (~34GB, higher quality)
-#   ./download-model-q4.sh   # Q4 (~18GB, smaller/faster)
+# Model switching: Edit .env file to change MODEL_FILE and MODEL_ALIAS
+#   Qwen3-8B-Q8_0.gguf  (~8GB)  - faster, for testing
+#   Qwen3-14B-Q8_0.gguf (~14GB) - more capable
+#   Qwen3-Coder-Next-Q8_0-00001-of-00003.gguf (~85GB) - best coding model (MoE 80B/3B active)
+#
+# Uses native LLAMA_ARG_* environment variables (no entrypoint.sh needed).
+# See: llama-server --help for all options.
 #
 # Usage:
 #   docker compose up -d
 #   curl http://localhost:8091/v1/chat/completions \
 #     -H "Content-Type: application/json" \
-#     -d '{"model": "qwen3-coder", "messages": [{"role": "user", "content": "Hello"}]}'
-#
-# Performance (after warmup):
-#   Prompt: ~400-480 tok/s | Generation: ~35-40 tok/s
-#
-# Use with Qwen Code CLI (https://github.com/QwenLM/qwen-code):
-#   export OPENAI_API_BASE=http://localhost:8091/v1
-#   export OPENAI_API_KEY=not-needed
-#   export OPENAI_MODEL=qwen3-coder
-#   qwen
-#
-# Note: First request is slower due to Vulkan shader compilation
+#     -d '{"model": "qwen3", "messages": [{"role": "user", "content": "Hello"}]}'
 ############################################################################
 
 services:
   llm-server:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: llm-vulkan:latest
-    container_name: llm-vulkan
-    hostname: llm-vulkan
+      dockerfile: .docker/LLM-ROCm.Dockerfile
+    image: llm-rocm:latest
+    container_name: llm-rocm
+    hostname: llm-rocm
 
     ports:
       - "8091:8091"
 
     environment:
-      # Model configuration (download with ./download-model.sh or ./download-model-q4.sh)
-      # Q8 model (default): Qwen3-Coder-30B-A3B-Instruct-1M-UD-Q8_K_XL.gguf
-      # Q4 model (smaller): Qwen3-Coder-30B-A3B-Instruct-1M-UD-Q4_K_XL.gguf
-      - MODEL_PATH=/models/Qwen3-Coder-30B-A3B-Instruct-1M-UD-Q8_K_XL.gguf
-      - MODEL_ALIAS=qwen3-coder
+      #-----------------------------------------------------------------
+      # llama-server native environment variables (LLAMA_ARG_*)
+      #-----------------------------------------------------------------
 
-      # GPU layers - Vulkan backend (999 = all layers on GPU)
-      - GPU_LAYERS=999
+      # Model configuration - set MODEL_FILE and MODEL_ALIAS in .env file
+      - LLAMA_ARG_MODEL=/models/${MODEL_FILE:-Qwen3-8B-Q8_0.gguf}
+      - LLAMA_ARG_ALIAS=${MODEL_ALIAS:-qwen3}
 
-      # Context window - 1M tokens (full capacity for Radeon 8060S)
-      - CTX_SIZE=1048576
+      # Server bind address and port
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8091
 
-      # Parallel request slots (2 = concurrent requests supported)
-      - PARALLEL=2
+      # GPU layers - ROCm HIP backend (999 = all layers on GPU)
+      - LLAMA_ARG_N_GPU_LAYERS=999
+
+      # Context window - 2 slots × 262K = 524288 total context
+      - LLAMA_ARG_CTX_SIZE=524288
+
+      # Parallel request slots (2 slots × 262K context ≈ 6.5 GB KV cache)
+      - LLAMA_ARG_N_PARALLEL=2
+
+      # Tool/function calling support (requires Jinja templates)
+      - LLAMA_ARG_JINJA=true
 
       # Performance optimizations
-      - FLASH_ATTENTION=true
-      - CONT_BATCHING=true
+      - LLAMA_ARG_FLASH_ATTN=on
+      - LLAMA_ARG_CONT_BATCHING=true
 
       # KV cache quantization: q8_0 for quality, q4_0 for max context
       # Options: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
-      - KV_CACHE_TYPE=q8_0
+      - LLAMA_ARG_CACHE_TYPE_K=q8_0
+      - LLAMA_ARG_CACHE_TYPE_V=q8_0
 
       # Batch sizes
-      - BATCH_SIZE=2048
-      - UBATCH_SIZE=512
+      - LLAMA_ARG_BATCH=2048
+      - LLAMA_ARG_UBATCH=512
 
-      # Keep model locked in RAM
-      - MLOCK=true
+      # Sampling defaults
+      # Qwen3-Coder-Next recommended: temp=1.0, top_p=0.95, top_k=40
+      # Qwen3 (non-coder) recommended: temp=0.6, top_p=0.95, top_k=20
+      - LLAMA_ARG_TOP_K=40
+
+      # Disable mmap - fixes catastrophically slow ROCm loading on UMA APUs
+      # See: https://github.com/ggml-org/llama.cpp/issues/15018
+      - LLAMA_ARG_MMAP=false
+
+      # Enable prometheus metrics endpoint
+      - LLAMA_ARG_ENDPOINT_METRICS=true
+
+      #-----------------------------------------------------------------
+      # ROCm / GPU environment variables
+      #-----------------------------------------------------------------
+
+      # ROCm gfx1151 fallback (set in Dockerfile, can override here)
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+
+      # Unified memory optimizations for Strix Halo UMA APU
+      - GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+      - HSA_XNACK=1
+      - ROCBLAS_USE_HIPBLASLT=1
+
+      # Limit GPU hardware queues for inference (reduces contention)
+      - GPU_MAX_HW_QUEUES=2
+
+    # Sampling params without native env vars - passed as CLI args
+    # Qwen3-Coder-Next recommended: temp=1.0, top_p=0.95, min_p=0.01
+    command: ["--temp", "1.0", "--top-p", "0.95", "--min-p", "0.01"]
 
     volumes:
       - ./models:/models:ro
       - llama-cache:/root/.cache
 
-    # GPU access for Vulkan (uses /dev/dri only)
+    # GPU access for ROCm (needs /dev/kfd + /dev/dri)
     devices:
+      - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
 
     # Use numeric GIDs for video/render groups
-    # Run `getent group video render` to find your system's GIDs
     group_add:
       - "44"    # video
-      - "992"   # render (adjust if different on your system)
+      - "992"   # render
 
-    # Allow unlimited memory locking (required for MLOCK=true)
+    # ROCm HSA runtime requirements
+    ipc: host
+    security_opt:
+      - seccomp=unconfined
+
+    # Allow unlimited memory locking (required for --mlock)
     ulimits:
       memlock:
         soft: -1
         hard: -1
 
-    # Memory limits for 128GB Ryzen AI Max+ 395 system
-    # Q8 model (~34GB) + q8_0 KV cache (~52GB) = ~85GB required
+    # Memory limits for 128GB unified memory system (32GB OS + 96GB GPU VRAM)
+    # GPU VRAM (96GB) is managed by ROCm/amdgpu outside this limit.
+    # This limit covers CPU-side: model loading, KV cache spill, llama.cpp overhead.
+    # Qwen3-8B Q8_0: ~8GB model + ~6GB KV cache = ~14GB
+    # Qwen3-14B Q8_0: ~14GB model + ~8GB KV cache = ~22GB
+    # Qwen3-Coder-Next Q8_0: ~85GB model + ~1.5GB KV cache = ~87GB
     deploy:
       resources:
         limits:
-          memory: 110G
+          memory: 120G
         reservations:
-          memory: 85G
+          memory: 96G
+
+  ##########################################################################
+  # ROCm GPU Test Container
+  ##########################################################################
+  rocm-test:
+    profiles:
+      - test
+    build:
+      context: .
+      dockerfile: .docker/ROCm.Dockerfile
+
+    command: bash -c 'sleep infinity'
+    volumes:
+      - ./rocm-test:/opt/rocm-test
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - "992"   # render group GID
+      - "44"    # video group GID
+    ipc: host
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - TZ=America/Chicago
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+    cap_add:
+      - SYS_PTRACE
 
 volumes:
   llama-cache:
